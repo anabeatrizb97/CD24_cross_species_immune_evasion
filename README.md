@@ -1,6 +1,6 @@
 # CD24-mediated immune evasion across species
 
-This repository contains analysis code used in [Paper Title and DOI]-
+This repository contains analysis code used in [Paper Title and DOI].
 
 The study integrates:
 - Dual-species bulk RNA-seq from zebrafish xenografts of human colorectal cancer tumors
