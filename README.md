@@ -1,8 +1,10 @@
-# CD24 cross-species immune evasion
+# CD24-mediated immune evasion across species
 
-Code for analyses integrating:
-- Dual-species bulk RNA-seq from zebrafish xenograft tumors (human tumor + zebrafish TME/host)
-- TCGA colorectal cancer analyses
-- Public zebrafish single-cell data (Zebrahub)
+This repository contains analysis code used in [Paper Title and DOI].
 
-Each dataset lives in its own folder and can be run independently.
+The study integrates:
+- Dual-species bulk RNA-seq from zebrafish xenografts of human colorectal cancer tumors
+- TCGA colorectal cancer datasets
+- Public zebrafish single-cell RNA-seq data (from Zebrahub)
+
+Each dataset is analyzed independently and documented in its respective folder.
