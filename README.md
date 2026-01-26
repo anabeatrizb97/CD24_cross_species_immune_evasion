@@ -1,4 +1,4 @@
-# CD24-mediated immune evasion across species
+# Analysis code for [DOI]
 
 This repository contains analysis code used in [Paper Title and DOI].
 
