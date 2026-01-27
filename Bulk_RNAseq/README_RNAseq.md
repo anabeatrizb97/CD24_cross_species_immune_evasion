@@ -1,7 +1,6 @@
 # Bulk RNA-seq analysis of SW480 and SW620 xenografts
 
 This folder contains all scripts used to process and analyze bulk RNA-sequencing data from tumors dissected from 2dpi zebrafish xenografts of human colorectal cancer cell lines SW480 and SW620.
-
 Dual-species transcript quantification was performed to separately analyze human tumor-derived transcripts and zebrafish host/tumor microenvironment (TME) transcripts.
 
 ---
@@ -9,9 +8,9 @@ Dual-species transcript quantification was performed to separately analyze human
 ## Overview of the analysis
 
 1. **Transcript quantification**
-   - Salmon was used to quantify transcripts independently against:
-     - Human transcriptome (GRCh38)
-     - Zebrafish transcriptome (GRCz11)
+   - Salmon was used to quantify transcripts independently against reference Ensembl transcriptomes (release 115):
+     - Human (GRCh38)
+     - Zebrafish (GRCz11)
    - Lane-split FASTQ files were quantified as single-end reads.
 
 2. **Gene-level summarization and differential expression**
@@ -20,13 +19,14 @@ Dual-species transcript quantification was performed to separately analyze human
 
 3. **Gene set enrichment analysis (GSEA)**
    - Preranked GSEA was performed using gene-level t-statistics.
+   - Genesets were retrieved via Enrich API and snapshotted to ensure reproducibility.
    - Enrichment was assessed separately for human tumor genes and zebrafish host genes.
 
 ---
 
 ## Scripts
 
-Scripts should be run in the order listed below.
+Scripts should be run in the order listed below:
 
 ### 01_quantify_salmon_dual_species.sh
 Quantifies RNA-seq reads using Salmon against human and zebrafish transcriptomes.
@@ -39,7 +39,6 @@ Quantifies RNA-seq reads using Salmon against human and zebrafish transcriptomes
 - `results/salmon/human/<SAMPLE>/quant.sf`
 - `results/salmon/zebrafish/<SAMPLE>/quant.sf`
 
----
 
 ### 02_DEG_analysis.R
 Performs gene-level differential expression analysis for human and zebrafish data.
@@ -59,34 +58,21 @@ Performs gene-level differential expression analysis for human and zebrafish dat
 - `processed_data.RData`
 - `sessionInfo.txt`
 
----
 
 ### 03_GSEA_analysis.py
 Performs preranked GSEA on human and zebrafish gene expression data.
 
 **Key steps**
 - Ranking genes by limma t-statistics
-- Downloading gene sets from Enrichr
+- Retrieval of gene sets via Enrichr API
 - Running preranked GSEA using `gseapy`
 - Exporting full and significant enrichment results
 
 ---
 
-## Software versions
-
-- Salmon: v1.10.3
-- R: v4.5.1
-- edgeR: v4.8.2
-- limma: v3.66.0
-- tximport: v1.38.2
-- gseapy: see `sessionInfo.txt` / Python environment
-
----
-
 ## Data availability
 
-Raw RNA-seq data is deposited in GEO under accession **GSE163746**.
-
-Processed quantification files (`quant.sf`) and downstream analysis outputs generated for this study are provided as Supplementary Data accompanying the manuscript.
-
 This repository contains only the scripts required to reproduce the analyses.
+Software environments and package versions (python and R) can be found in `environment.yml` and `R_sessionInfo.txt` files.
+Raw RNA-seq data is deposited in GEO under accession **GSE163746** (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE163746).
+Processed quantification files (`quant.sf`) and relevant downstream analysis outputs generated for this study are provided as Supplementary Data accompanying the manuscript.

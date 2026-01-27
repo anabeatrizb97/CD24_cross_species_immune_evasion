@@ -99,7 +99,7 @@ make_or_load_tx2gene <- function(gtf, txdb_sqlite_path, tx2gene_rds_path) {
   if (file.exists(txdb_sqlite_path)) {
     txdb <- loadDb(txdb_sqlite_path)
   } else {
-    txdb <- makeTxDbFromGFF(gtf)
+    txdb <- txdbmaker::makeTxDbFromGFF(gtf)
     saveDb(txdb, txdb_sqlite_path)
   }
 

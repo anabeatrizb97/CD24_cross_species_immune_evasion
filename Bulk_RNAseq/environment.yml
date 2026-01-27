@@ -1,0 +1,22 @@
+name: bulk-rnaseq
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - salmon=1.10.3
+  - r-base=4.4.2
+  - r-essentials
+  - r-tidyverse
+  - r-here
+  - bioconductor-tximport
+  - bioconductor-genomicfeatures
+  - bioconductor-rtracklayer
+  - bioconductor-edger
+  - bioconductor-limma
+  - pip
+  - pip:
+      - gseapy==1.1.11
+      - pandas
+      - numpy
+      - requests
