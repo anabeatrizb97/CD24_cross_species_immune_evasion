@@ -1,364 +1,306 @@
 #!/usr/bin/env python3
 """
-TCGA colorectal cancer survival analysis
-- Stratified by CD24 and Siglec-10 expression
+TCGA COAD/READ survival analysis 
+- Acording to the expression of CD24 alone and CD24 + SIGLEC10+ TAM score
 
-Inputs (from UCSC Xena - check README file):
-- Gene expression matrices
-    - TCGA-COAD.star_fpkm-uq.tsv.gz
-    - TCGA-READ.star_fpkm-uq.tsv.gz
-- Clinical data
-    - TCGA-COAD.clinical.tsv(.gz)
-    - TCGA-READ.clinical.tsv(.gz)
-- Survival data
-    - TCGA_PanCancer_Survival.txt
+This script builds a single, harmonized analysis table used for all TCGA-based survival analyses in the study. It integrates gene expression 
+data with clinical and survival annotations and performs all preprocessing required prior to statistical testing and figure generation.
 
-Outputs:
-- TCGA_Patient_Data.csv
-- TCGA_CD24_Survival_Summary.csv
-- TCGA_CD24_Siglec10_Combined_Survival_Summary.csv
-- Kaplan-Meier Plots (OS + PFI)
+Inputs (from USC Xena Browser):
+  (1) COAD and READ patient-level gene expression matrices (`x.star_fpkm-uq.tsv`; genes x samples)
+  (2) PanCancer survival table (patient-level clinical + survival data)
+
+Output:
+  (1) Merged analysis table (for downstream analysis with `tcga_figures.py`)
+  Contains patient-level:
+  • Clinical annotations
+  • Overall Survival (OS) and Progression-Free Interval (PFI)
+  • CD24 expression
+  • SIGLEC10+ TAM score
+
+
+Path structure:
+
+<PROJECT_ROOT>/
+  tcga_analysis.py
+  tcga_figure.py
+  data/
+    TCGA-COAD.star_fpkm-uq.tsv
+    TCGA-READ.star_fpkm-uq.tsv
+    TCGA_PanCancer_Survival.txt
+  results/
+    processed/tcga_analysis_table.csv
 
 """
-
 from __future__ import annotations
-import argparse
-import gzip
-import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+import re
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from lifelines import KaplanMeierFitter
-from lifelines.statistics import logrank_test, multivariate_logrank_test
+
+DAYS_PER_MONTH = 30.4375
+
+# 5-year cutoff (in months) for PFI censoring columns
+PFI_CUTOFF_MONTHS = 60.0
+
+# Ensembl IDs of genes of interest
+GENES = {
+    "ENSG00000272398": "CD24",
+    "ENSG00000142512": "SIGLEC10",
+    "ENSG00000129226": "CD68",
+    "ENSG00000182578": "CSF1R",
+    "ENSG00000169896": "ITGAM",
+    "ENSG00000203747": "FCGR3A",
+    "ENSG00000174837": "ADGRE1",
+  }
+MAC_MARKERS = ["CD68", "CSF1R", "ITGAM", "FCGR3A", "ADGRE1"]
+
+_STAGE_ORDER = {"I": 1, "II": 2, "III": 3, "IV": 4}
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def read_table(path: Path, sep: str = "\t") -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing input file: {path}")
-    if path.suffix == ".gz":
-        return pd.read_csv(path, sep=sep, compression="gzip", low_memory=False)
-    return pd.read_csv(path, sep=sep, low_memory=False)
+def project_root() -> Path:
+    return Path(__file__).resolve().parent
 
 
-def read_xena_expression(path: Path) -> pd.DataFrame:
-
-    df = read_table(path, sep="\t")
-    first_col = df.columns[0]
-    df = df.rename(columns={first_col: "gene"})
-    df["gene"] = df["gene"].astype(str)
-    df = df.set_index("gene")
-    return df
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def tcga_barcode_to_patient(barcode: str) -> str:
+def tcga_patient_id(barcode: str) -> str:
+    if pd.isna(barcode):
+        return np.nan
     return str(barcode)[:12]
 
 
-def normalize_stage(raw: str) -> Optional[str]:
-    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
-        return None
-    s = str(raw).strip()
-    if s == "" or s.lower() in {"na", "nan", "not reported"}:
-        return None
-
-    m = re.search(r"stage\s*([iv]+)", s.lower())
-    if not m:
-        return None
-    roman = m.group(1).upper()
-    if roman in {"I", "II", "III", "IV"}:
-        return roman
-    return None
-
-
-def safe_log2_fpkm_uq(x: pd.Series) -> pd.Series:
-    x = pd.to_numeric(x, errors="coerce")
-    x = x.fillna(0.0)
-    x = x.clip(lower=0.0)
-    return np.log2(x + 1.0)
-
-
-def median_group(series: pd.Series, high_label="High", low_label="Low") -> Tuple[pd.Series, float]:
-    s = pd.to_numeric(series, errors="coerce")
-    med = float(np.nanmedian(s.values))
-    grp = np.where(s >= med, high_label, low_label)
-    return pd.Series(grp, index=series.index), med
-
-
-def km_plot_2group(df: pd.DataFrame, time_col: str, event_col: str, group_col: str,
-                   title: str, outpath: Optional[Path] = None) -> None:
-    plt.figure(figsize=(5, 4))
-    kmf = KaplanMeierFitter()
-
-    for g in ["Low", "High"]:
-        sub = df[df[group_col] == g]
-        if sub.empty:
-            continue
-        kmf.fit(sub[time_col], event_observed=sub[event_col], label=g)
-        kmf.plot(ci_show=False)
-
-    plt.title(title)
-    plt.xlabel("Time (days)")
-    plt.ylabel("Survival probability")
-    plt.tight_layout()
-    if outpath is not None:
-        outpath.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(outpath, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def logrank_2group(df: pd.DataFrame, time_col: str, event_col: str, group_col: str) -> float:
-    a = df[df[group_col] == "Low"]
-    b = df[df[group_col] == "High"]
-    if a.empty or b.empty:
+def tcga_sample_type(barcode: str) -> str:
+    """
+    TCGA sample type is the first 2 digits of the 4th barcode field.
+    Example: TCGA-XX-YYYY-01A-... -> sample_type = "01" (Primary Tumor)
+    """
+    if pd.isna(barcode):
         return np.nan
-    res = logrank_test(a[time_col], b[time_col], event_observed_A=a[event_col], event_observed_B=b[event_col])
-    return float(res.p_value)
+    parts = str(barcode).split("-")
+    if len(parts) >= 4 and len(parts[3]) >= 2:
+        return parts[3][:2]
+    return np.nan
 
 
-def logrank_4group(df: pd.DataFrame, time_col: str, event_col: str, group_col: str) -> float:
-    sub = df.dropna(subset=[time_col, event_col, group_col]).copy()
-    if sub[group_col].nunique() < 2:
+def normalize_stage(raw):
+    if pd.isna(raw):
         return np.nan
-    res = multivariate_logrank_test(sub[time_col], sub[group_col], sub[event_col])
-    return float(res.p_value)
+    s = str(raw).upper().strip()
+    m = re.search(r"STAGE\s*([IV]+)", s)
+    if m:
+        return m.group(1)
+    if s in {"I", "II", "III", "IV"}:
+        return s
+    return np.nan
 
 
-# ----------------------------
-# Main
-# ----------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", type=Path, required=True,
-                    help="Folder containing the downloaded Xena files.")
-    ap.add_argument("--out_dir", type=Path, required=True,
-                    help="Folder to write outputs (CSVs and optional plots).")
-    ap.add_argument("--coad_expr", type=str, default="TCGA-COAD.star_fpkm-uq.tsv.gz")
-    ap.add_argument("--read_expr", type=str, default="TCGA-READ.star_fpkm-uq.tsv.gz")
-    ap.add_argument("--coad_clin", type=str, default="TCGA-COAD.clinical.tsv")
-    ap.add_argument("--read_clin", type=str, default="TCGA-READ.clinical.tsv")
-    ap.add_argument("--survival", type=str, default="TCGA_PanCancer_Survival.txt")
-    ap.add_argument("--out_patient", type=str, default="TCGA_Patient_Data.csv")
-    ap.add_argument("--out_cd24", type=str, default="TCGA_CD24_Survival_Summary.csv")
-    ap.add_argument("--out_combo", type=str, default="TCGA_CD24_Siglec10_Combined_Survival_Summary.csv")
+def pick_max_stage(x: pd.Series):
+    x = x.dropna().astype(str)
+    x = x[x.isin(_STAGE_ORDER)]
+    if len(x) == 0:
+        return np.nan
+    return max(x, key=lambda s: _STAGE_ORDER.get(s, 0))
 
-    # TAM gene set
-    ap.add_argument(
-        "--tam_genes",
-        type=str,
-        default="SIGLEC10,C1QA,C1QB,C1QC,APOE,LST1,CSF1R,TYROBP,FCER1G,AIF1,CD68,MSR1",
-        help="Comma-separated TAM gene list used to compute Siglec10_TAM_Score.",
+
+def first_nonnull(x: pd.Series):
+    x = x.dropna()
+    return x.iloc[0] if len(x) else np.nan
+
+
+def _base_ensembl_id(idx: pd.Index) -> pd.Index:
+    s = pd.Index(idx.astype(str))
+    s = s.str.split("|").str[0]
+    s = s.str.split(".").str[0]
+    return s
+
+
+def load_xena_expression_minimal(path: Path, needed_ensg: list[str]) -> pd.DataFrame:
+    """
+    Xena expression matrix is genes x samples.
+    We normalize gene IDs, subset to needed genes, then transpose to samples x genes.
+    """
+    raw = pd.read_csv(path, sep="\t", index_col=0)
+    raw.index = _base_ensembl_id(raw.index)
+
+    # If stripping versions creates duplicates, average them
+    if raw.index.has_duplicates:
+        raw = raw.groupby(raw.index).mean(numeric_only=True)
+
+    raw = raw.reindex(needed_ensg)
+
+    df = raw.T
+    df.index.name = "sample"
+    df.reset_index(inplace=True)
+    return df
+
+
+def load_survival(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, sep="\t")
+    df.rename(columns={df.columns[0]: "sample"}, inplace=True)
+
+    df["patient_id"] = df["sample"].map(tcga_patient_id)
+
+    df["time"] = pd.to_numeric(df.get("OS.time"), errors="coerce") / DAYS_PER_MONTH
+    df["event"] = pd.to_numeric(df.get("OS"), errors="coerce")
+
+    df["pfi_time"] = pd.to_numeric(df.get("PFI.time"), errors="coerce") / DAYS_PER_MONTH
+    df["pfi_event"] = pd.to_numeric(df.get("PFI"), errors="coerce")
+
+    if "ajcc_pathologic_tumor_stage" in df.columns:
+        df["stage"] = df["ajcc_pathologic_tumor_stage"]
+    elif "stage" in df.columns:
+        df["stage"] = df["stage"]
+    else:
+        df["stage"] = np.nan
+
+    df["stage"] = df["stage"].map(normalize_stage)
+
+    wanted = [
+        "sample",
+        "patient_id",
+        "stage",
+        "time",
+        "event",
+        "pfi_time",
+        "pfi_event",
+        "gender",
+        "race",
+        "vital_status",
+        "age_at_initial_pathologic_diagnosis",
+        "cancer type abbreviation",
+    ]
+    for c in wanted:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    return df[wanted]
+
+
+def pick_representative_sample(sub: pd.DataFrame, gene_cols: list[str]) -> pd.Series:
+    """
+    Choose one main sample per patient:
+      1) Prefer Primary Tumor (sample_type == "01") if present
+      2) Within the remaining, choose the sample with highest CD24 expression
+         (falls back to highest median across loaded genes if CD24 missing)
+    """
+    sub = sub.copy()
+
+    # Prefer primary tumor if any
+    if (sub["sample_type"] == "01").any():
+        sub = sub[sub["sample_type"] == "01"].copy()
+
+    cd24_ensg = "ENSG00000272398"
+    if cd24_ensg in sub.columns:
+        key = pd.to_numeric(sub[cd24_ensg], errors="coerce")
+    else:
+        key = sub[gene_cols].median(axis=1, numeric_only=True)
+
+    # If all NaN, fall back deterministically to first row
+    if key.notna().any():
+        return sub.loc[key.idxmax()]
+    return sub.iloc[0]
+
+
+def main() -> None:
+    root = project_root()
+    data_dir = root / "data"
+    out_dir = root / "results" / "processed"
+    ensure_dir(out_dir)
+
+    needed_ensg = list(GENES.keys())
+
+    print("Loading expression matrices...")
+    expr_coad = load_xena_expression_minimal(data_dir / "TCGA-COAD.star_fpkm-uq.tsv", needed_ensg)
+    expr_read = load_xena_expression_minimal(data_dir / "TCGA-READ.star_fpkm-uq.tsv", needed_ensg)
+    expr = pd.concat([expr_coad, expr_read], ignore_index=True)
+
+    expr["patient_id"] = expr["sample"].map(tcga_patient_id)
+    expr["sample_type"] = expr["sample"].map(tcga_sample_type)
+
+    gene_cols = [c for c in expr.columns if c not in {"sample", "patient_id", "sample_type"}]
+    print(f"  Expression rows (samples): {expr.shape[0]} | genes loaded: {len(gene_cols)}")
+
+    for c in gene_cols:
+        expr[c] = pd.to_numeric(expr[c], errors="coerce")
+
+    # ---------------------------
+    # Patient-level expression:
+    # ---------------------------
+    expr_pat = (
+        expr.groupby("patient_id", dropna=False, sort=False)
+        .apply(lambda sub: pick_representative_sample(sub, gene_cols), include_groups=False)
+        .reset_index()
     )
-    ap.add_argument("--make_plots", action="store_true", help="Also export KM plots (optional).")
 
-    args = ap.parse_args()
+    # Keep only patient_id + gene columns
+    keep_cols = ["patient_id"] + gene_cols
+    expr_pat = expr_pat[keep_cols].copy()
 
-    in_dir = args.input_dir
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    surv = load_survival(data_dir / "TCGA_PanCancer_Survival.txt")
 
-    # ---- load expression ----
-    expr_coad = read_xena_expression(in_dir / args.coad_expr)
-    expr_read = read_xena_expression(in_dir / args.read_expr)
-
-    # concatenate cohorts by columns (samples)
-    expr = pd.concat([expr_coad, expr_read], axis=1)
-
-    # ---- load clinical ----
-    clin_coad = read_table(in_dir / args.coad_clin, sep="\t")
-    clin_read = read_table(in_dir / args.read_clin, sep="\t")
-    clin = pd.concat([clin_coad, clin_read], ignore_index=True)
-
-    # Xena clinical usually includes "sample" column
-    if "sample" not in clin.columns:
-        # try common alternatives
-        for cand in ["Sample", "sampleID", "submitter_id"]:
-            if cand in clin.columns:
-                clin = clin.rename(columns={cand: "sample"})
-                break
-    if "sample" not in clin.columns:
-        raise ValueError(f"Clinical file missing sample id column. Columns: {list(clin.columns)}")
-
-    clin["patient_id"] = clin["sample"].map(tcga_barcode_to_patient)
-
-    # stage column
-    stage_col = "ajcc_pathologic_stage.diagnoses"
-    if stage_col not in clin.columns:
-        # fallback search
-        candidates = [c for c in clin.columns if "pathologic_stage" in c.lower() or "ajcc" in c.lower() and "stage" in c.lower()]
-        if not candidates:
-            raise ValueError(f"Could not find a stage column in clinical. Columns: {list(clin.columns)}")
-        stage_col = candidates[0]
-
-    clin["Stage"] = clin[stage_col].map(normalize_stage)
-
-    # ---- survival ----
-    surv = read_table(in_dir / args.survival, sep="\t")
-    # survival table has sample IDs; harmonize to patient-level
-    if "sample" not in surv.columns:
-        # first col is "sample"
-        surv = surv.rename(columns={surv.columns[0]: "sample"})
-    surv["patient_id"] = surv["sample"].map(tcga_barcode_to_patient)
-
-    # Keep patient-level unique entries (first occurrence)
-    surv = surv.sort_values("sample").drop_duplicates("patient_id", keep="first")
-
-    # ---- Build patient table ----
-    # Map cohort by sample barcode: COAD vs READ
-    cohort_map = {}
-    for s in expr_coad.columns:
-        cohort_map[tcga_barcode_to_patient(s)] = "COAD"
-    for s in expr_read.columns:
-        cohort_map[tcga_barcode_to_patient(s)] = "READ"
-
-    # Extract CD24 and SIGLEC10 vectors
-    for g in ["CD24", "SIGLEC10"]:
-        if g not in expr.index:
-            raise ValueError(
-                f"Gene '{g}' not found in expression matrix rownames. "
-                f"Tip: check expr.index[:20] to see whether genes are symbols or Ensembl IDs."
-            )
-
-    cd24 = safe_log2_fpkm_uq(expr.loc["CD24"])
-    sig10 = safe_log2_fpkm_uq(expr.loc["SIGLEC10"])
-
-    # TAM score
-    tam_genes = [x.strip() for x in args.tam_genes.split(",") if x.strip()]
-    missing_tam = [g for g in tam_genes if g not in expr.index]
-    if missing_tam:
-        raise ValueError(
-            "These TAM genes are missing from expression matrix rownames:\n"
-            + ", ".join(missing_tam)
-            + "\n\nEdit --tam_genes or add a symbol/Ensembl mapping step."
+    surv_pat = (
+        surv.groupby("patient_id", dropna=False)
+        .agg(
+            stage=("stage", pick_max_stage),
+            time=("time", first_nonnull),
+            event=("event", first_nonnull),
+            pfi_time=("pfi_time", first_nonnull),
+            pfi_event=("pfi_event", first_nonnull),
+            gender=("gender", first_nonnull),
+            race=("race", first_nonnull),
+            vital_status=("vital_status", first_nonnull),
+            age_at_initial_pathologic_diagnosis=("age_at_initial_pathologic_diagnosis", first_nonnull),
+            cancer_type_abbreviation=("cancer type abbreviation", first_nonnull),
         )
+        .reset_index()
+    )
 
-    tam_mat = expr.loc[tam_genes].apply(safe_log2_fpkm_uq, axis=1)
-    tam_score = tam_mat.mean(axis=0)
+    df = expr_pat.merge(surv_pat, on="patient_id", how="inner")
 
-    # Patient IDs per sample column
-    patient_ids = pd.Index([tcga_barcode_to_patient(x) for x in expr.columns], name="patient_id")
-
-    df_pat = pd.DataFrame(
-        {
-            "patient_id": patient_ids,
-            "cohort": [cohort_map.get(pid, "COAD/READ") for pid in patient_ids],
-            "CD24_Expression_Log2": cd24.values,
-            "SIGLEC10_Expression_Log2": sig10.values,
-            "Siglec10_TAM_Score": tam_score.values,
+    # Rename clinical fields
+    df = df.rename(
+        columns={
+            "age_at_initial_pathologic_diagnosis": "age_at_diagnosis",
+            "cancer_type_abbreviation": "cancer_type",
         }
-    ).drop_duplicates("patient_id", keep="first")
+    )
 
-    # add stage (patient-level)
-    clin_pat = clin.sort_values("sample").drop_duplicates("patient_id", keep="first")[["patient_id", "Stage"]]
-    df_pat = df_pat.merge(clin_pat, on="patient_id", how="left")
+    # Create *_expr columns 
+    for ens, name in GENES.items():
+        if ens in df.columns:
+            df[f"{name}_expr"] = pd.to_numeric(df[ens], errors="coerce")
 
-    # add survival endpoints (patient-level)
-    keep_surv = ["patient_id", "OS", "OS.time", "PFI", "PFI.time"]
-    missing_cols = [c for c in keep_surv if c not in surv.columns]
-    if missing_cols:
-        raise ValueError(f"Survival table missing columns: {missing_cols}. Columns: {list(surv.columns)}")
+    mac_cols = [f"{g}_expr" for g in MAC_MARKERS if f"{g}_expr" in df.columns]
+    df["Macrophage_score"] = df[mac_cols].mean(axis=1) if mac_cols else np.nan
+    df["SIGLEC10_TAM_score"] = pd.to_numeric(df.get("SIGLEC10_expr"), errors="coerce") * pd.to_numeric(
+        df.get("Macrophage_score"), errors="coerce"
+    )
 
-    df_pat = df_pat.merge(surv[keep_surv], on="patient_id", how="left")
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df["event"] = pd.to_numeric(df["event"], errors="coerce")
 
-    # group splits
-    df_pat["CD24_Group"], cd24_med = median_group(df_pat["CD24_Expression_Log2"], high_label="High", low_label="Low")
-    df_pat["Siglec10_TAM_Group"], tam_med = median_group(df_pat["Siglec10_TAM_Score"], high_label="High", low_label="Low")
+    # ---------------------------
+    # PFI cutoff columns:
+    # ---------------------------
+    df["pfi_time"] = pd.to_numeric(df["pfi_time"], errors="coerce")
+    df["pfi_event"] = pd.to_numeric(df["pfi_event"], errors="coerce")
 
-    def combined_group(row) -> str:
-        return f"{row['CD24_Group']}/{row['Siglec10_TAM_Group']}"
+    df["pfi_time_5yr"] = df["pfi_time"].clip(upper=PFI_CUTOFF_MONTHS)
+    df["pfi_event_5yr"] = np.where(df["pfi_time"] > PFI_CUTOFF_MONTHS, 0, df["pfi_event"])
 
-    df_pat["Combined_Group"] = df_pat.apply(combined_group, axis=1)
+    df = df.dropna(subset=["stage", "CD24_expr", "time", "event"])
 
-    # Save patient table (this is your “main output”)
-    df_pat = df_pat.sort_values(["Stage", "patient_id"]).reset_index(drop=True)
-    df_pat.to_csv(out_dir / args.out_patient, index=False)
+    out_path = out_dir / "tcga_analysis_table.csv"
+    df.to_csv(out_path, index=False)
 
-    # ---- Survival summaries ----
-    def summarize_cd24(df_stage: pd.DataFrame, endpoint: str) -> Dict:
-        time_col = f"{endpoint}.time"
-        event_col = endpoint
-        sub = df_stage.dropna(subset=[time_col, event_col, "CD24_Group"]).copy()
-        sub[time_col] = pd.to_numeric(sub[time_col], errors="coerce")
-        sub[event_col] = pd.to_numeric(sub[event_col], errors="coerce")
-        sub = sub.dropna(subset=[time_col, event_col])
-
-        p = logrank_2group(sub, time_col, event_col, "CD24_Group")
-
-        out = {
-            "Endpoint": endpoint,
-            "Stage": sub["Stage"].iloc[0] if len(sub) else df_stage["Stage"].iloc[0],
-            "N (tumor samples)": int(len(sub)),
-            "Events": int(sub[event_col].sum()) if len(sub) else 0,
-            "Log-rank p": p,
-            "CD24_Low": int((sub["CD24_Group"] == "Low").sum()),
-            "CD24_High": int((sub["CD24_Group"] == "High").sum()),
-        }
-        return out
-
-    def summarize_combo(df_stage: pd.DataFrame, endpoint: str) -> Dict:
-        time_col = f"{endpoint}.time"
-        event_col = endpoint
-        sub = df_stage.dropna(subset=[time_col, event_col, "Combined_Group"]).copy()
-        sub[time_col] = pd.to_numeric(sub[time_col], errors="coerce")
-        sub[event_col] = pd.to_numeric(sub[event_col], errors="coerce")
-        sub = sub.dropna(subset=[time_col, event_col])
-
-        p4 = logrank_4group(sub, time_col, event_col, "Combined_Group")
-
-        # counts per combined group
-        counts = sub["Combined_Group"].value_counts().to_dict()
-        out = {
-            "Endpoint": endpoint,
-            "Stage": sub["Stage"].iloc[0] if len(sub) else df_stage["Stage"].iloc[0],
-            "N (tumor samples)": int(len(sub)),
-            "Events": int(sub[event_col].sum()) if len(sub) else 0,
-            "Log-rank p (4-group)": p4,
-            "Low/Low": int(counts.get("Low/Low", 0)),
-            "Low/High": int(counts.get("Low/High", 0)),
-            "High/Low": int(counts.get("High/Low", 0)),
-            "High/High": int(counts.get("High/High", 0)),
-        }
-        return out
-
-    # stage-wise summaries (I–IV)
-    stages = ["I", "II", "III", "IV"]
-    cd24_rows = []
-    combo_rows = []
-
-    for st in stages:
-        df_st = df_pat[df_pat["Stage"] == st].copy()
-        if df_st.empty:
-            continue
-        for ep in ["OS", "PFI"]:
-            cd24_rows.append(summarize_cd24(df_st, ep))
-            combo_rows.append(summarize_combo(df_st, ep))
-
-        if args.make_plots:
-            # optional plots (not required for your repo)
-            for ep in ["OS", "PFI"]:
-                km_plot_2group(
-                    df_st, time_col=f"{ep}.time", event_col=ep, group_col="CD24_Group",
-                    title=f"{ep} | Stage {st} | CD24 High vs Low",
-                    outpath=out_dir / "plots" / f"KM_{ep}_Stage{st}_CD24.png",
-                )
-
-    df_cd24 = pd.DataFrame(cd24_rows).sort_values(["Endpoint", "Stage"]).reset_index(drop=True)
-    df_combo = pd.DataFrame(combo_rows).sort_values(["Endpoint", "Stage"]).reset_index(drop=True)
-
-    df_cd24.to_csv(out_dir / args.out_cd24, index=False)
-    df_combo.to_csv(out_dir / args.out_combo, index=False)
-
-    print("Saved:")
-    print(" -", out_dir / args.out_patient)
-    print(" -", out_dir / args.out_cd24)
-    print(" -", out_dir / args.out_combo)
-    print("\nMedians used:")
-    print(f" - CD24 median (log2): {cd24_med:.6f}")
-    print(f" - TAM median  (log2): {tam_med:.6f}")
+    print(f"\n✓ Wrote analysis table: {out_path}")
+    print(f"Patients: {df['patient_id'].nunique()}")
+    print(f"Stage counts: {df['stage'].value_counts(dropna=False).to_dict()}")
+    print(f"PFI available: {df['pfi_time'].notna().any()}")
+    print(f"PFI 5yr columns written: pfi_time_5yr, pfi_event_5yr (cutoff={PFI_CUTOFF_MONTHS} months)")
 
 
 if __name__ == "__main__":
