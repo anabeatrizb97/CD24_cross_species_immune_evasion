@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TCGA COAD/READ survival analysis 
-- Acording to the expression of CD24 alone and CD24 + SIGLEC10+ TAM score
+- Acording to CD24 expression 
 
 This script builds a single, harmonized analysis table used for all TCGA-based survival analyses in the study. It integrates gene expression 
 data with clinical and survival annotations and performs all preprocessing required prior to statistical testing and figure generation.
@@ -16,11 +16,8 @@ Output:
   • Clinical annotations
   • Overall Survival (OS) and Progression-Free Interval (PFI)
   • CD24 expression
-  • SIGLEC10+ TAM score
-
 
 Path structure:
-
 <PROJECT_ROOT>/
   tcga_analysis.py
   tcga_figure.py
@@ -43,17 +40,10 @@ DAYS_PER_MONTH = 30.4375
 # 5-year cutoff (in months) for PFI censoring columns
 PFI_CUTOFF_MONTHS = 60.0
 
-# Ensembl IDs of genes of interest
+# CD24 Ensembl ID
 GENES = {
     "ENSG00000272398": "CD24",
-    "ENSG00000142512": "SIGLEC10",
-    "ENSG00000129226": "CD68",
-    "ENSG00000182578": "CSF1R",
-    "ENSG00000169896": "ITGAM",
-    "ENSG00000203747": "FCGR3A",
-    "ENSG00000174837": "ADGRE1",
   }
-MAC_MARKERS = ["CD68", "CSF1R", "ITGAM", "FCGR3A", "ADGRE1"]
 
 _STAGE_ORDER = {"I": 1, "II": 2, "III": 3, "IV": 4}
 
@@ -272,12 +262,6 @@ def main() -> None:
     for ens, name in GENES.items():
         if ens in df.columns:
             df[f"{name}_expr"] = pd.to_numeric(df[ens], errors="coerce")
-
-    mac_cols = [f"{g}_expr" for g in MAC_MARKERS if f"{g}_expr" in df.columns]
-    df["Macrophage_score"] = df[mac_cols].mean(axis=1) if mac_cols else np.nan
-    df["SIGLEC10_TAM_score"] = pd.to_numeric(df.get("SIGLEC10_expr"), errors="coerce") * pd.to_numeric(
-        df.get("Macrophage_score"), errors="coerce"
-    )
 
     df["time"] = pd.to_numeric(df["time"], errors="coerce")
     df["event"] = pd.to_numeric(df["event"], errors="coerce")
